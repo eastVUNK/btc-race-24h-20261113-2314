@@ -11,7 +11,10 @@ cbBTC/USDC closes.
 - Exit, first of: take-profit +0.8% vs entry cost, hard stop -0.5% vs
   entry cost, or EMA(12) crossing back below EMA(36).
 - Cooldown: 60 bars after any exit before a new entry.
-- Equity guard: flatten everything if equity falls 8% below its peak.
+- Equity guard: flatten everything if equity falls 8% below its peak,
+  and latch: once tripped, no new entries for the rest of the run
+  (exits always stay possible). A guard that only flattens once would
+  let the bot re-enter the same crashing market after the cooldown.
 
 Protocol: agent-fun/bars-replay/v1, via the kit's vendored shim
 (vendor/makefun_bars.py, byte-identical to sdk/makefun_bars.py).
@@ -107,10 +110,12 @@ class Series:
 SERIES = Series()
 LAST_EXIT_SEQ = -10 ** 9
 PEAK_EQUITY = 0
+# Latched once the equity guard trips: no new entries afterwards.
+GUARD_TRIPPED = False
 
 
 def on_batch(state, batch):
-    global LAST_EXIT_SEQ, PEAK_EQUITY
+    global LAST_EXIT_SEQ, PEAK_EQUITY, GUARD_TRIPPED
     if state.warming_up:
         return []
     bar = None
@@ -129,11 +134,17 @@ def on_batch(state, batch):
     if state.equity > PEAK_EQUITY:
         PEAK_EQUITY = state.equity
 
+    # The guard is about equity, not about being in a position: evaluate
+    # it every batch, so a slow bleed across losing round trips can trip
+    # it even while flat. Once tripped it latches for the rest of the run.
+    guard_hit = state.equity * GUARD_DEN < PEAK_EQUITY * GUARD_NUM
+    if guard_hit:
+        GUARD_TRIPPED = True
+
     held = state.positions.get(SYMBOL)
     if held is not None:
         value = state.value(SYMBOL, held.qty)
         cost = held.cost
-        guard_hit = state.equity * GUARD_DEN < PEAK_EQUITY * GUARD_NUM
         take_profit = value * TP_DEN >= cost * TP_NUM
         stop_hit = value * STOP_DEN <= cost * STOP_NUM
         cross_down = (
@@ -152,7 +163,10 @@ def on_batch(state, batch):
             }]
         return []
 
-    # Flat: only a confirmed cross-up entry, after the cooldown.
+    # Flat: only a confirmed cross-up entry, after the cooldown — and
+    # never after the equity guard has tripped.
+    if GUARD_TRIPPED:
+        return []
     if state.seq - LAST_EXIT_SEQ < COOLDOWN_BARS:
         return []
     if gap is None or prev_gap is None:
